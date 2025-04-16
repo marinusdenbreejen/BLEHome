@@ -1,0 +1,7 @@
+#pip install -r requirements.txt
+PyYAML>=5.4.1
+matplotlib>=3.3.0
+PyYAML>=5.4.1
+matplotlib>=3.3.0
+paho-mqtt>=1.6.1
+scipy>=1.4.1
