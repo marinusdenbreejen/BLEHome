@@ -17,6 +17,7 @@ alpha = 0.3
 room_stability_threshold = 3
 room_history = []
 
+
 MQTT_SUB_TOPIC = "espresense/devices/#"
 MQTT_PUB_TOPIC_BASE = "espresense/BLEtracker"
 
