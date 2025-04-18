@@ -8,6 +8,7 @@ from datetime import datetime
 from scipy.optimize import least_squares
 import paho.mqtt.client as mqtt
 
+# Global configuration and runtime tracking variables
 config = None
 allowed_devices = []
 nodes_dict = {}
@@ -16,19 +17,25 @@ device_positions = {}  # smoothed position per device
 room_histories = {}  # room history per device
 discovery_published = set()
 
+# Smoothing and stability parameters
 alpha = 0.3
-room_stability_threshold = 3
+room_stability_threshold = 5
 
 MQTT_SUB_TOPIC = "espresense/devices/#"
 MQTT_PUB_TOPIC_BASE = "espresense/BLEtracker"
 
+# Load the YAML configuration for nodes, devices, and settings
+
 def load_config():
-    global config, nodes_dict, allowed_devices
+    global config, nodes_dict, allowed_devices, away_timeout
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
     nodes_dict = {n["name"].lower(): n for n in config.get("nodes", [])}
     allowed_devices = config.get("devices", [])
+    away_timeout = config.get("away_timeout", 120)
     print("[BLEtracker] Configuration loaded.")
+
+# Check if the incoming device matches the whitelist in the config
 
 def is_device_allowed(device_data):
     device_id = device_data.get("id", "")
@@ -42,6 +49,8 @@ def is_device_allowed(device_data):
         if eid and device_id == eid:
             return True
     return False
+
+# Estimate position using weighted least squares multilateration
 
 def multilaterate(nodes, measurements):
     positions, distances, used_nodes, weights = [], [], [], []
@@ -57,10 +66,12 @@ def multilaterate(nodes, measurements):
 
     if not positions:
         raise Exception("No measurements available.")
+
+    # Convert to numpy for optimization
     positions = np.array(positions)
     distances = np.array(distances)
     weights = np.array(weights)
-    x0 = np.mean(positions, axis=0)
+    x0 = np.mean(positions, axis=0)  # Initial guess
 
     def residuals(X):
         return weights * (np.linalg.norm(positions - X, axis=1) - distances)
@@ -68,6 +79,8 @@ def multilaterate(nodes, measurements):
     result = least_squares(residuals, x0)
     accuracy = np.sqrt(np.mean((residuals(result.x) / weights)**2))
     return result.x, used_nodes, accuracy
+
+# Check if a 2D point is inside a polygon using ray-casting algorithm
 
 def point_in_polygon(x, y, poly):
     inside = False
@@ -83,6 +96,8 @@ def point_in_polygon(x, y, poly):
         p1x, p1y = p2x, p2y
     return inside
 
+# Determine which room a 3D point belongs to, or fallback to closest room
+
 def find_room_for_point(P):
     x, y, z = P
     candidates = []
@@ -95,7 +110,23 @@ def find_room_for_point(P):
                 candidates.append(room.get("name", "Unknown"))
     if candidates:
         return candidates[0], 100.0
-    return "Unknown", 0.0
+
+    # Fallback: find the closest room centroid if no match
+    closest_room = "Unknown"
+    min_dist = float("inf")
+    for floor in config.get("floors", []):
+        for room in floor.get("rooms", []):
+            points = room.get("points", [])
+            if not points:
+                continue
+            centroid = np.mean(points, axis=0)
+            dist = np.linalg.norm(np.array([x, y]) - centroid)
+            if dist < min_dist:
+                min_dist = dist
+                closest_room = room.get("name", "Unknown")
+    return closest_room, 0.0
+
+# Smooth room transitions by checking recent room history for consistency
 
 def get_stable_room(device_id, current_guess):
     if device_id not in room_histories:
@@ -107,6 +138,8 @@ def get_stable_room(device_id, current_guess):
     if len(set(history)) == 1:
         return current_guess
     return history[-2] if len(history) > 1 else current_guess
+
+# MQTT callback to handle incoming BLE measurements
 
 def on_message(client, userdata, msg):
     try:
@@ -132,12 +165,16 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print("[BLEtracker] Error processing MQTT message:", e)
 
+# MQTT callback triggered upon connecting to the broker
+
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"[BLEtracker] Connected to MQTT broker at {mqtt_host}:{mqtt_port}")
         client.subscribe(MQTT_SUB_TOPIC)
     else:
         print(f"[BLEtracker] MQTT connection failed with code {rc}")
+
+# Create and configure the MQTT client
 
 def setup_mqtt_client():
     client = mqtt.Client()
@@ -151,11 +188,15 @@ def setup_mqtt_client():
     client.loop_start()
     return client
 
+# Apply exponential smoothing to the device's estimated position
+
 def update_smoothed_position(device_id, current_pos):
     if device_id not in device_positions:
         device_positions[device_id] = current_pos
     else:
         device_positions[device_id] = alpha * current_pos + (1 - alpha) * device_positions[device_id]
+
+# Publish an MQTT discovery message for Home Assistant integration
 
 def publish_mqtt_discovery(client, device_id, device_name):
     temp_data = {"id": device_id, "name": device_name}
@@ -178,21 +219,29 @@ def publish_mqtt_discovery(client, device_id, device_name):
     }
     client.publish(topic, json.dumps(payload), retain=True)
 
+# Main loop to process and publish BLE device location estimates
+
 def process_tracking_cycle(client):
     now = time.time()
     for device_id, measurements in node_measurements.items():
+        # Filter only fresh measurements
         fresh = {
             n: d["distance"]
             for n, d in measurements.items()
             if now - d["timestamp"] <= measurement_timeout
         }
 
-        if not fresh:
-            continue
-
         device_name = next((d.get("name", "unknown") for d in measurements.values() if d), "unknown")
 
-        if now - last_publish_time.get(device_id, 0) >= publish_interval:
+        time_since_last_seen = max([now - d["timestamp"] for d in measurements.values()], default=0)
+        if time_since_last_seen > away_timeout:
+            # Mark device as away
+            stable_room = "away"
+            fast_room = "away"
+            accuracy = None
+            used_nodes = []
+            smoothed_pos = [0, 0, 0]
+        else:
             try:
                 if device_id not in discovery_published:
                     publish_mqtt_discovery(client, device_id, device_name)
@@ -203,27 +252,37 @@ def process_tracking_cycle(client):
                 smoothed_pos = device_positions[device_id]
                 raw_room, confidence = find_room_for_point(smoothed_pos)
                 stable_room = get_stable_room(device_id, raw_room)
-                timestamp = datetime.now().isoformat()
-
-                payload = {
-                    "fast_room": raw_room,
-                    "stable_room": stable_room,
-                    "used_nodes": used_nodes,
-                    "device_name": device_name,
-                    "device_id": device_id,
-                    "timestamp": timestamp,
-                    "accuracy": accuracy,
-                    "position": list(map(float, smoothed_pos))
-                }
-
-                pub_topic = f"{MQTT_PUB_TOPIC_BASE}/{device_id}"
-                client.publish(pub_topic, json.dumps(payload))
-
-                print(f"[BLEtracker] {device_id} at {stable_room} ({accuracy:.2f}m accuracy)")
-
+                fast_room = raw_room
             except Exception as e:
                 print(f"[BLEtracker] Multilateration error for {device_id}:", e)
+                stable_room = "unknown"
+                fast_room = "unknown"
+                accuracy = None
+                used_nodes = []
+                smoothed_pos = [0, 0, 0]
+
+        if now - last_publish_time.get(device_id, 0) >= publish_interval:
+            # Publish tracking results
+            timestamp = datetime.now().isoformat()
+            payload = {
+                "fast_room": fast_room,
+                "stable_room": stable_room,
+                "used_nodes": used_nodes,
+                "device_name": device_name,
+                "device_id": device_id,
+                "timestamp": timestamp,
+                "accuracy": accuracy,
+                "position": list(map(float, smoothed_pos))
+            }
+
+            pub_topic = f"{MQTT_PUB_TOPIC_BASE}/{device_id}"
+            client.publish(pub_topic, json.dumps(payload))
+
+            print(f"[BLEtracker] {device_id} at {stable_room} ({accuracy if accuracy is not None else 'N/A'} accuracy)")
+
             last_publish_time[device_id] = now
+
+# Initialize the system, load config, and start the MQTT client
 
 def initialize_tracker():
     global mqtt_host, mqtt_port, mqtt_username, mqtt_password, mqtt_ssl
@@ -243,6 +302,7 @@ def initialize_tracker():
 
     return setup_mqtt_client()
 
+# Entry point
 if __name__ == "__main__":
     client = initialize_tracker()
     print("[BLEtracker] Running multi-device BLE tracker. Press Ctrl+C to exit.")
