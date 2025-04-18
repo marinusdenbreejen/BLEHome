@@ -161,4 +161,8 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ---
 
+<<<<<<< HEAD
 Made with ❤️ for smarter spaces.
+=======
+Made with ❤️ for smarter spaces.
+>>>>>>> 576fe5ac063ea6a2de1794a1178c04290ac3f134
