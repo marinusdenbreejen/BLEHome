@@ -158,6 +158,10 @@ def update_smoothed_position(device_id, current_pos):
         device_positions[device_id] = alpha * current_pos + (1 - alpha) * device_positions[device_id]
 
 def publish_mqtt_discovery(client, device_id, device_name):
+    temp_data = {"id": device_id, "name": device_name}
+    if not is_device_allowed(temp_data):
+        return
+
     topic = f"homeassistant/device_tracker/{device_id}/config"
     payload = {
         "name": device_name,
