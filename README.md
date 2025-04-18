@@ -34,7 +34,7 @@
 ├── bletracker.py            # Main tracking script (run this)
 ├── config.yaml              # Node/device/room layout configuration
 ├── requirements.txt         # Python dependencies
-└── README.md
+└── README.md                # This file
 ```
 
 ---
@@ -98,9 +98,7 @@ Payload includes:
 {
   "fast_room": "Living Room",
   "stable_room": "Living Room",
-  "used_nodes": {
-    "node1": {"distance": 2.34, "var": 0.02}
-  },
+  "used_nodes": ["node1", "node2"],
   "device_name": "MyPhone",
   "device_id": "aa:bb:cc:dd:ee:ff",
   "timestamp": "2025-04-16T12:34:56.789Z",
@@ -131,6 +129,7 @@ sensor:
 - 🧠 **Room Guessing + Confidence**: Chooses best-fit room even when coordinates are near boundaries.
 - 🚫 **Device Whitelisting**: Only process selected device IDs.
 - ⏱️ **Time-based Filtering**: Ignores stale measurements.
+- ↔️ **Fallback Locators**: Nearest-node fallback when multilateration fails.
 
 ---
 
@@ -161,8 +160,5 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ---
 
-<<<<<<< HEAD
 Made with ❤️ for smarter spaces.
-=======
-Made with ❤️ for smarter spaces.
->>>>>>> 576fe5ac063ea6a2de1794a1178c04290ac3f134
+
