@@ -11,9 +11,10 @@ import paho.mqtt.client as mqtt
 config = None
 allowed_devices = []
 nodes_dict = {}
-node_measurements = {}  # now maps device_id -> node_name -> measurement
+node_measurements = {}  # device_id -> node_name -> measurement
 device_positions = {}  # smoothed position per device
 room_histories = {}  # room history per device
+discovery_published = set()
 
 alpha = 0.3
 room_stability_threshold = 3
@@ -156,6 +157,23 @@ def update_smoothed_position(device_id, current_pos):
     else:
         device_positions[device_id] = alpha * current_pos + (1 - alpha) * device_positions[device_id]
 
+def publish_mqtt_discovery(client, device_id, device_name):
+    topic = f"homeassistant/device_tracker/{device_id}/config"
+    payload = {
+        "name": device_name,
+        "unique_id": f"{device_id}_tracker",
+        "state_topic": f"{MQTT_PUB_TOPIC_BASE}/{device_id}",
+        "value_template": "{{ value_json.stable_room }}",
+        "json_attributes_topic": f"{MQTT_PUB_TOPIC_BASE}/{device_id}",
+        "device": {
+            "identifiers": [device_id],
+            "name": device_name,
+            "model": "BLEtracker",
+            "manufacturer": "DIY"
+        }
+    }
+    client.publish(topic, json.dumps(payload), retain=True)
+
 def process_tracking_cycle(client):
     now = time.time()
     for device_id, measurements in node_measurements.items():
@@ -172,6 +190,10 @@ def process_tracking_cycle(client):
 
         if now - last_publish_time.get(device_id, 0) >= publish_interval:
             try:
+                if device_id not in discovery_published:
+                    publish_mqtt_discovery(client, device_id, device_name)
+                    discovery_published.add(device_id)
+
                 est_pos, used_nodes, accuracy = multilaterate(nodes_dict, fresh)
                 update_smoothed_position(device_id, est_pos)
                 smoothed_pos = device_positions[device_id]
