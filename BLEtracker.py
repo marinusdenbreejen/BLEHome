@@ -18,8 +18,8 @@ room_histories = {}  # room history per device
 discovery_published = set()
 
 # Smoothing and stability parameters
-alpha = 0.3
-room_stability_threshold = 5
+alpha = 0.2
+room_stability_threshold = 10
 
 MQTT_SUB_TOPIC = "espresense/devices/#"
 MQTT_PUB_TOPIC_BASE = "espresense/BLEtracker"
@@ -48,27 +48,47 @@ def is_device_allowed(device_data):
             return True
     return False
 
-# Estimate position using weighted least squares multilateration
+# Multilateration via weighted least squares
+# Given RSSI-derived distances to at least three fixed nodes, solve for the device position that best
+# fits the measured distances. Returns the estimated XYZ position, the list of nodes used, and a
+# residual-based accuracy metric (lower is better).
 def multilaterate(nodes, measurements):
-    positions, distances, used_nodes, weights = [], [], [], []
-    for name, node in nodes.items():
-        if name in measurements:
-            p = np.array(node["point"], dtype=float)
-            positions.append(p)
-            distances.append(measurements[name])
-            weights.append(1.0 / max(measurements[name], 0.1))
-            used_nodes.append(name)
-    if not positions:
-        raise ValueError("No measurements available for multilateration.")
-    positions = np.array(positions)
-    distances = np.array(distances)
-    weights = np.array(weights)
-    x0 = np.mean(positions, axis=0)
+    # 1. Gather valid node positions and their corresponding measured distances
+    pts, dists, used, wts = [], [], [], []
+    for nm, node in nodes.items():
+        if nm in measurements:
+            p = np.array(node["point"], dtype=float)  # fixed node coordinates
+            dist = measurements[nm]  # measured distance to node
+            pts.append(p)
+            dists.append(dist)
+            # Weight inversely proportional to distance (avoid division by zero)
+            wts.append(1.0 / max(dist, 0.1))
+            used.append(nm)
+    # If no measurements are available, cannot multilaterate
+    if not pts:
+        raise ValueError("No measurements for multilateration.")
+
+    # Convert lists to numpy arrays for vectorized computation
+    pts = np.array(pts)
+    dists = np.array(dists)
+    wts = np.array(wts)
+
+    # 2. Initial guess: centroid of node positions
+    x0 = np.mean(pts, axis=0)
+
+    # 3. Define residuals function: difference between estimated and measured distances,
+    # scaled by weights
     def residuals(X):
-        return weights * (np.linalg.norm(positions - X, axis=1) - distances)
+        return wts * (np.linalg.norm(pts - X, axis=1) - dists)
+
+    # 4. Run least-squares optimization to minimize weighted residuals
     result = least_squares(residuals, x0)
-    accuracy = np.sqrt(np.mean((residuals(result.x) / weights)**2))
-    return result.x, used_nodes, accuracy
+
+    # 5. Compute accuracy as RMS of normalized residuals
+    acc = np.sqrt(np.mean((residuals(result.x) / wts)**2))
+
+    # Return estimated position, which nodes were used, and accuracy metric
+    return result.x, used, acc
 
 # Check if a 2D point is inside a polygon using ray-casting algorithm
 def point_in_polygon(x, y, poly):
