@@ -159,7 +159,7 @@ def on_message(client, userdata, msg):
         if not is_device_allowed(data):
             return
         dist = data.get("distance")
-        if data.get("var", 0) > 0.5:
+        if data.get("var", 0) > 1.5:
             return
         node = msg.topic.split("/")[-1].lower()
         did = data.get("id", "unknown")
