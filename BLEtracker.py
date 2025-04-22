@@ -4,9 +4,14 @@ import time
 import json
 import yaml
 import numpy as np
+
+
 from datetime import datetime
 from scipy.optimize import least_squares
 import paho.mqtt.client as mqtt
+
+import numpy as np
+from scipy.optimize import minimize
 
 # Global configuration and runtime tracking variables
 config = None
@@ -90,6 +95,61 @@ def multilaterate(nodes, measurements):
     # Return estimated position, which nodes were used, and accuracy metric
     return result.x, used, acc
 
+
+def multilaterate_nm(nodes, measurements,
+                     weight_fn=lambda d: 1.0/max(d, 0.1),
+                     nm_options=None):
+    """
+    Multilateration via Nelder–Mead simplex.
+    
+    Args:
+        nodes (dict): mapping node names → {"point": [x,y,z], ...}
+        measurements (dict): mapping node names → measured distance (float)
+        weight_fn (callable): fn(distance) → weight; defaults to 1/max(d,0.1)
+        nm_options (dict): passed to scipy.optimize.minimize(method='Nelder-Mead')
+        
+    Returns:
+        x_est (ndarray): estimated [x,y,z] device position
+        used (list): list of node names actually used
+        acc (float): RMS of un‐weighted residuals (lower is better)
+    """
+    # 1. Collect valid anchors
+    pts, dists, used, wts = [], [], [], []
+    for name, node in nodes.items():
+        if name in measurements:
+            dist = float(measurements[name])
+            pts.append(np.array(node["point"], dtype=float))
+            dists.append(dist)
+            wts.append(weight_fn(dist))
+            used.append(name)
+    if len(pts) < 3:
+        raise ValueError("Need at least 3 measurements for 3D multilateration.")
+    
+    pts  = np.vstack(pts)         # shape (M,3)
+    dists= np.array(dists)        # shape (M,)
+    wts  = np.array(wts)          # shape (M,)
+    
+    # 2. Initial guess = centroid of anchors
+    x0 = pts.mean(axis=0)
+    
+    # 3. Objective = sum of squared weighted residuals
+    def obj(x):
+        res = wts * (np.linalg.norm(pts - x, axis=1) - dists)
+        return np.sum(res**2)
+    
+    # 4. Run Nelder–Mead
+    if nm_options is None:
+        nm_options = {'xatol':1e-6, 'fatol':1e-6, 'maxiter':1000}
+    res = minimize(obj, x0, method='Nelder-Mead', options=nm_options)
+    
+    # 5. Compute un‑weighted RMS error for interpretability
+    final_res = np.linalg.norm(pts - res.x, axis=1) - dists
+    acc = np.sqrt(np.mean(final_res**2))
+    
+    return res.x, used, acc
+
+
+
 # Check if a 2D point is inside a polygon using ray-casting algorithm
 def point_in_polygon(x, y, poly):
     inside = False
@@ -132,6 +192,22 @@ def find_room_for_point(P):
 
 # Smoothed room transitions
 def get_stable_room(device_id, current_guess):
+    """
+    Determines the most stable room for a given device based on its recent room history.
+
+    This function maintains a history of room guesses for each device and determines
+    the most stable room by checking if the recent guesses are consistent. If all
+    guesses in the history are the same, it returns the current guess as the stable room.
+    Otherwise, it returns the second-to-last guess if available, or the current guess
+    as a fallback.
+
+    Args:
+        device_id (str): The unique identifier for the device.
+        current_guess (str): The current room guess for the device.
+
+    Returns:
+        str: The most stable room for the device based on its recent history.
+    """
     room_histories.setdefault(device_id, []).append(current_guess)
     hist = room_histories[device_id]
     if len(hist) > room_stability_threshold:
@@ -159,7 +235,7 @@ def on_message(client, userdata, msg):
         if not is_device_allowed(data):
             return
         dist = data.get("distance")
-        if data.get("var", 0) > 1.5:
+        if dist is None or dist > 10:
             return
         node = msg.topic.split("/")[-1].lower()
         did = data.get("id", "unknown")
@@ -216,7 +292,7 @@ def process_tracking_cycle(client):
             est_pos, used, acc = None, [], None
             if len(fresh) >= 3:
                 try:
-                    est_pos, used, acc = multilaterate(nodes_dict, fresh)
+                    est_pos, used, acc = multilaterate_nm(nodes_dict, fresh)
                 except Exception as e:
                     print(f"[BLEtracker] LS error for {did}:", e)
             # fallback if no estimate
@@ -251,7 +327,9 @@ def process_tracking_cycle(client):
             }
             topic = f"{MQTT_PUB_TOPIC_BASE}/{did}"
             client.publish(topic, json.dumps(payload))
-            print(f"[BLEtracker] {did} at {stable} ({acc if acc else 'N/A'})")
+            used_nodes_str = ", ".join(f"{n}:{fresh[n]:.2f}" for n in used if n in fresh)
+            print(f"[BLEtracker] {did} at {stable} ({acc if acc else 'N/A'}) | nodes: {used_nodes_str}")
+        
             last_publish_time[did] = now
 
 # Initialization
