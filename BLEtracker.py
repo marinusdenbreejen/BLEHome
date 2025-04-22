@@ -315,15 +315,18 @@ def process_tracking_cycle(client):
         # publish if interval elapsed
         if now - last_publish_time.get(did, 0) >= publish_interval:
             ts = datetime.now().isoformat()
+            # Add distances from each used node
+            node_distances = {n: fresh[n] for n in used if n in fresh}
             payload = {
-                "fast_room": fast,
-                "stable_room": stable,
-                "used_nodes": used,
-                "device_name": dname,
-                "device_id": did,
-                "timestamp": ts,
-                "accuracy": acc,
-                "position": list(map(float, spos))
+            "fast_room": fast,
+            "stable_room": stable,
+            "used_nodes": used,
+            "device_name": dname,
+            "device_id": did,
+            "timestamp": ts,
+            "accuracy": acc,
+            "position": list(map(float, spos)),
+            "node_distances": node_distances
             }
             topic = f"{MQTT_PUB_TOPIC_BASE}/{did}"
             client.publish(topic, json.dumps(payload))
