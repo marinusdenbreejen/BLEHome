@@ -216,6 +216,6 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="ESPResense BLE visualisation Web server")
     ap.add_argument("--host", default="0.0.0.0", help="HTTP bind address")
-    ap.add_argument("--port", type=int, default=5000, help="HTTP port")
+    ap.add_argument("--port", type=int, default=6000, help="HTTP port")
     args = ap.parse_args()
     main(args.host, args.port)
