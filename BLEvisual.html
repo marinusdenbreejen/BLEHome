@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>ESPResense BLE Visualiser</title>
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            width: 100%;
+            background: #111;
+            font-family: sans-serif;
+            color: #eee;
+        }
+        #root {
+            display: flex;
+            height: 100%;
+        }
+        /* Make the map canvas flex-grow to fill the space */
+        #map {
+            flex: 1;
+            outline: none; /* prevent blue focus border on click */
+        }
+        #sidebar {
+            width: 260px;
+            background: #1b1b1b;
+            padding: 10px;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+        h3 {
+            margin: 8px 0 4px;
+            font-size: 16px;
+            border-bottom: 1px solid #333;
+        }
+        label {
+            display: block;
+            margin-bottom: 4px;
+        }
+        .device {
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+        }
+        .device:hover {
+            background: #333;
+        }
+        .selected {
+            background: #ffffff5e !important;
+        }
+        #deviceInfo {
+            margin-top: 12px;
+            padding: 8px;
+            background: #222;
+            border: 1px solid #444;
+            border-radius: 4px;
+        }
+        /* Mouse-coordinate overlay (bottom-right corner) */
+        #mouse-coords {
+            position: fixed;
+            right: 12px;
+            bottom: 10px;
+            background: rgba(0,0,0,0.75);
+            color: #fff;
+            font: 14px/18px monospace;
+            padding: 4px 10px;
+            border-radius: 5px;
+            z-index: 10000;
+            pointer-events: none;
+            min-width: 100px;
+            text-align: right;
+            box-shadow: 0 0 6px rgba(0,0,0,0.6);
+        }
+    </style>
+</head>
+<body>
+<div id="root">
+    <canvas id="map" width="1200" height="800" tabindex="0"></canvas>
+    <div id="sidebar">
+        <h3>Floors</h3>
+        <div id="floorsUI"></div>
+        <h3>Devices</h3>
+        <div id="deviceUI"></div>
+        <div id="deviceInfo">
+            <h3>Details</h3>
+        </div>
+    </div>
+</div>
+
+<!-- Mouse/data-coordinates overlay -->
+<div id="mouse-coords">x: ---, y: ---</div>
+
+<script>
+// Get canvas and context
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+
+// Canvas dimensions
+let W, H;
+
+// Store the current transform so we can invert it for mouse coords
+let transform = { b: { x:0, y:0, s:1 }, offX:0, offY:0 };
+
+// Resize canvas to fit window (minus sidebar)
+function resize() {
+    W = canvas.width = window.innerWidth - 260;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Data and UI state
+let data, lastStamp = 0;
+let visibleFloors = new Set();
+let selectedDevice = null;
+
+// Sidebar UI elements
+const floorsUI = document.getElementById('floorsUI');
+const deviceUI = document.getElementById('deviceUI');
+const deviceInfo = document.getElementById('deviceInfo');
+
+// Populate device details panel
+function updateDeviceInfo() {
+    deviceInfo.innerHTML = '<h3>Details</h3>';
+    if (!selectedDevice || !data) return;
+    const d = data.devices[selectedDevice];
+    // Current room (stable)
+    const roomP = document.createElement('p');
+    roomP.innerHTML = `<strong>Room:</strong> ${d.room_stable || 'unknown'}`;
+    deviceInfo.appendChild(roomP);
+    // Floor
+    const floorP = document.createElement('p');
+    floorP.innerHTML = `<strong>Floor:</strong> ${d.floor_id || 'unknown'}`;
+    deviceInfo.appendChild(floorP);
+    // Node distances and last seen
+    const list = document.createElement('ul');
+    const now = Date.now() / 1000;
+    (d.used_nodes_info || []).forEach(info => {
+        const secsAgo = (now - info.last_seen).toFixed(1);
+        const nodeCfg = data.nodes[info.node] || {};
+        const nodeFloors = nodeCfg.floor_ids ? nodeCfg.floor_ids.join(',') : 'unknown';
+        const li = document.createElement('li');
+        li.textContent = `${info.node}: ${info.distance.toFixed(1)} m, ${secsAgo} s ago`;
+        list.appendChild(li);
+    });
+    deviceInfo.appendChild(list);
+}
+
+// Create floor visibility checkboxes
+function makeFloorControls(floors) {
+    floorsUI.innerHTML = '';
+    floors.forEach(f => {
+        const id = 'fl_' + f.id;
+        const lbl = document.createElement('label');
+        lbl.innerHTML = `<input type="checkbox" id="${id}" checked> ${f.name}`;
+        floorsUI.appendChild(lbl);
+        document.getElementById(id).addEventListener('change', e => {
+            e.target.checked ? visibleFloors.add(f.id) : visibleFloors.delete(f.id);
+            draw();
+        });
+        visibleFloors.add(f.id);
+    });
+}
+
+// Create device list radio buttons
+function makeDeviceList(devices) {
+    deviceUI.innerHTML = '';
+    Object.entries(devices).forEach(([did, d]) => {
+        const lbl = document.createElement('label');
+        lbl.className = 'device';
+        const radio = document.createElement('input');
+        radio.type = 'radio'; radio.name = 'device-select'; radio.value = did;
+        radio.checked = selectedDevice === did;
+        radio.onclick = () => {
+            selectedDevice = radio.checked ? did : null;
+            draw();
+            Array.from(deviceUI.children).forEach(el => el.classList.remove('selected'));
+            if (selectedDevice) lbl.classList.add('selected');
+            updateDeviceInfo();
+        };
+        lbl.appendChild(radio);
+        lbl.appendChild(document.createTextNode(' ' + (d.device_name || did)));
+        if (selectedDevice === did) lbl.classList.add('selected');
+        deviceUI.appendChild(lbl);
+    });
+    updateDeviceInfo();
+}
+
+// Transform a point from data to canvas coordinates
+function tx(pt, b) {
+    return [(pt[0] - b.x) * b.s, (pt[1] - b.y) * b.s];
+}
+
+// Draw everything on the canvas
+function draw() {
+    if (!data) return;
+    ctx.clearRect(0, 0, W, H);
+    const b = { x: data.bounds.x, y: data.bounds.y, s: Math.min(W / data.bounds.w, H / data.bounds.h) * 0.9 };
+    const offX = (W - b.s * data.bounds.w) / 2;
+    const offY = (H - b.s * data.bounds.h) / 2;
+    transform = { b, offX, offY };
+    ctx.save();
+    ctx.translate(offX, offY);
+
+    // Draw rooms
+    data.floors.filter(f => visibleFloors.has(f.id)).forEach(f => {
+        f.rooms.forEach(r => {
+            ctx.beginPath();
+            r.points.forEach((p, i) => {
+                const [x, y] = tx(p, b);
+                i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+            });
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(80,80,80,0.25)';
+            ctx.fill();
+            ctx.strokeStyle = '#555'; ctx.lineWidth = 1; ctx.stroke();
+        });
+    });
+
+    // Draw nodes
+    Object.values(data.nodes).forEach(n => {
+        if (!n.floor_ids.some(fid => visibleFloors.has(fid))) return;
+        const [x, y] = tx(n.point, b);
+        ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI);
+        ctx.fillStyle = '#0ff'; ctx.fill(); ctx.strokeStyle = '#005'; ctx.stroke();
+        ctx.fillStyle = '#0ff'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(n.name, x + 6, y - 6);
+    });
+
+    // Draw devices
+    Object.entries(data.devices).forEach(([did, d]) => {
+        if (!visibleFloors.has(d.floor_id)) return;
+        const [x, y] = tx(d.position, b);
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI);
+        ctx.fillStyle = did === selectedDevice ? '#ff0' : '#f80'; ctx.fill();
+        ctx.strokeStyle = '#500'; ctx.stroke();
+        ctx.fillStyle = '#f80'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(d.device_name || did, x + 6, y - 6);
+    });
+
+    // Draw distance circles for selected device
+    if (selectedDevice && data.devices[selectedDevice]) {
+        const d = data.devices[selectedDevice];
+        Object.entries(d.node_distances || {}).forEach(([n, dist]) => {
+            const node = data.nodes[n];
+            if (!node || !node.floor_ids.some(fid => visibleFloors.has(fid))) return;
+            const [cx, cy] = tx(node.point, b);
+            const r = dist * b.s;
+            ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+            ctx.strokeStyle = 'rgba(255,255,0,0.6)'; ctx.lineWidth = 1;
+            ctx.setLineDash([6,4]); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle = '#ff0'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText(dist.toFixed(1) + ' m', cx, cy - r - 4);
+        });
+    }
+
+    ctx.restore();
+}
+
+// Poll server for updates
+async function poll() {
+    try {
+        const res = await fetch('/data');
+        const d = await res.json();
+        if (d.timestamp !== lastStamp) {
+            lastStamp = d.timestamp; data = d;
+            if (!floorsUI.childElementCount) makeFloorControls(d.floors);
+            makeDeviceList(d.devices);
+            draw();
+        }
+    } catch (e) { console.error(e); } finally { setTimeout(poll, 1000); }
+}
+poll();
+
+// Mouse/data-coordinate overlay
+const mouseCoords = document.getElementById('mouse-coords');
+canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+    const dx = (cx - transform.offX) / transform.b.s + transform.b.x;
+    const dy = (cy - transform.offY) / transform.b.s + transform.b.y;
+    mouseCoords.textContent = `x: ${dx.toFixed(1)}, y: ${dy.toFixed(1)} ; X: ${cx}, Y: ${cy}`;
+});
+canvas.addEventListener('mouseleave', () => { mouseCoords.textContent = 'x: ---, y: ---'; });
+</script>
+</body>
+</html>

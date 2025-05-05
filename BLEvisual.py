@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ble_visual.py
+"""ble_visual_server.py
 =================================
 Interactive Web visualisation of ESPresense rooms, nodes and BLE devices.
 
@@ -22,7 +22,7 @@ Run with:
 pip install flask pyyaml paho-mqtt numpy
 python ble_visual_server.py
 ``` 
-then browse to *http://localhost:5000/*.
+then browse to *http://localhost:5000/*. 
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ MQTT_USER = MQTT_CFG.get("username")
 MQTT_PASS = MQTT_CFG.get("password")
 MQTT_SSL  = bool(MQTT_CFG.get("ssl", False))
 
-MQTT_TOPIC = "espresense/BLEtracker/#"
+MQTT_TOPIC = "espresense/BLEtracker/detail/#"
 
 # ---------------------------------------------------------------------------
 # Runtime state (updated by MQTT thread)
@@ -127,56 +127,12 @@ def mqtt_thread():
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-#load INDEX_HTML from file
-
-
-INDEX_HTML = """<!doctype html>
-<html lang=\"en\"><head><meta charset=\"utf-8\">
-<title>ESPResense BLE Visualiser</title>
-<style>
-  html,body{margin:0;height:100%;width:100%;background:#111;font-family:sans-serif;color:#eee}
-  #root{display:flex;height:100%}
-  #canvas{flex:1}
-  #sidebar{width:220px;background:#1b1b1b;padding:10px;box-sizing:border-box;overflow-y:auto}
-  h3{margin:8px 0 4px;font-size:16px;border-bottom:1px solid #333}
-  label{display:block;margin-bottom:4px}
-  .device{cursor:pointer;padding:4px;border-radius:4px}
-  .device:hover{background:#333}
-  .selected{background:#555 !important}
-</style></head><body>
-<div id=\"root\">
-  <canvas id=\"canvas\"></canvas>
-  <div id=\"sidebar\">
-    <h3>Floors</h3><div id=floorsUI></div>
-    <h3>Devices</h3><div id=deviceUI></div>
-  </div>
-</div>
-<script>
-const canvas=document.getElementById('canvas');const ctx=canvas.getContext('2d');
-let W,H;function resize(){W=canvas.width=window.innerWidth-220;H=canvas.height=window.innerHeight;}window.addEventListener('resize',resize);resize();
-let data,lastStamp=0,visibleFloors=new Set(),selectedDevice=null;
-const floorsUI=document.getElementById('floorsUI');const deviceUI=document.getElementById('deviceUI');
-function makeFloorControls(floors){floorsUI.innerHTML='';floors.forEach(f=>{const id='fl_'+f.id;const c=document.createElement('label');c.innerHTML=`<input type=checkbox id=${id} checked> ${f.name}`;floorsUI.appendChild(c);document.getElementById(id).addEventListener('change',e=>{e.target.checked?visibleFloors.add(f.id):visibleFloors.delete(f.id);draw();});visibleFloors.add(f.id);});}
-function makeDeviceList(devices){deviceUI.innerHTML='';Object.entries(devices).forEach(([did,d])=>{const div=document.createElement('div');div.className='device';div.textContent=d.device_name||did;div.onclick=()=>{selectedDevice=selectedDevice===did?null:did;draw();Array.from(deviceUI.children).forEach(el=>el.classList.remove('selected'));if(selectedDevice)div.classList.add('selected');};deviceUI.appendChild(div);});}
-function tx(pt,b){return[(pt[0]-b.x)*b.s,(pt[1]-b.y)*b.s];}
-function draw(){if(!data)return;ctx.clearRect(0,0,W,H);const b={x:data.bounds.x,y:data.bounds.y,s:Math.min(W/data.bounds.w,H/data.bounds.h)*0.9};const offX=(W-b.s*data.bounds.w)/2,offY=(H-b.s*data.bounds.h)/2;ctx.save();ctx.translate(offX,offY);
-  // rooms
-  data.floors.filter(f=>visibleFloors.has(f.id)).forEach(f=>{f.rooms.forEach(r=>{ctx.beginPath();r.points.forEach((p,i)=>{const[tX,tY]=tx(p,b);i?ctx.lineTo(tX,tY):ctx.moveTo(tX,tY);});ctx.closePath();ctx.fillStyle='rgba(80,80,80,.25)';ctx.fill();ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.stroke();});});
-  // nodes
-  Object.values(data.nodes).forEach(n=>{if(!n.floor_ids.some(fid=>visibleFloors.has(fid)))return;const[pX,pY]=tx(n.point,b);ctx.beginPath();ctx.arc(pX,pY,5,0,2*Math.PI);ctx.fillStyle='#0ff';ctx.fill();ctx.strokeStyle='#005';ctx.stroke();ctx.fillStyle='#0ff';ctx.font='12px sans-serif';ctx.textAlign='left';ctx.fillText(n.name,pX+6,pY-6);});
-  // devices
-  Object.entries(data.devices).forEach(([did,d])=>{if(!visibleFloors.has(d.floor_id))return;const[pX,pY]=tx(d.position,b);ctx.beginPath();ctx.arc(pX,pY,6,0,2*Math.PI);ctx.fillStyle=did===selectedDevice?'#ff0':'#f80';ctx.fill();ctx.strokeStyle='#500';ctx.stroke();ctx.fillStyle='#f80';ctx.font='12px sans-serif';ctx.textAlign='left';ctx.fillText(d.device_name||did,pX+6,pY-6);});
-  // distance circles for selected device
-  if(selectedDevice&&data.devices[selectedDevice]){const d=data.devices[selectedDevice];for(const [n,dist] of Object.entries(d.node_distances||{})){const node=data.nodes[n];if(!node||!node.floor_ids.some(fid=>visibleFloors.has(fid)))continue;const[cx,cy]=tx(node.point,b);const radius=dist*b.s;ctx.beginPath();ctx.arc(cx,cy,radius,0,2*Math.PI);ctx.strokeStyle='rgba(255,255,0,.6)';ctx.lineWidth=1;ctx.setLineDash([6,4]);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#ff0';ctx.font='12px sans-serif';ctx.textAlign='center';ctx.fillText(dist.toFixed(1)+' m',cx,cy-radius-4);}}
-  ctx.restore();}
-async function poll(){try{const res=await fetch('/data');const d=await res.json();if(d.timestamp!==lastStamp){lastStamp=d.timestamp;data=d;if(floorsUI.childElementCount===0)makeFloorControls(d.floors);makeDeviceList(d.devices);draw();}}catch(e){console.error(e);}finally{setTimeout(poll,1000);} }poll();
-</script></body></html>"""
-
+# load INDEX_HTML from file
+INDEX_HTML = Path(__file__).with_name("BLEvisual.html").read_text(encoding="utf-8")
 
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML)
-
 
 @app.route("/data")
 def data_endpoint():
@@ -220,12 +176,23 @@ def data_endpoint():
         pos = d.get("position") or [0, 0, 0]
         x_t, y_t = transform_point(pos[0], pos[1])
         floor_id = floor_id_for_z(pos[2]) or "unknown"
+
+        # pull out used_nodes_info
+        used_info = d.get("used_nodes_info", [])
+
+        # build used_nodes and distances
+        used_nodes = [info.get("node") for info in used_info]
+        node_distances = {info.get("node"): info.get("distance") for info in used_info}
+
         devices_js[did] = {
-            "device_name": d.get("device_name", did),
+            "device_name": d.get("name", did),
             "position": [x_t, y_t],
             "floor_id": floor_id,
-            "used_nodes": d.get("used_nodes", []),
-            "node_distances": d.get("node_distances", {})
+            "room_fast": d.get("room_fast"),
+            "room_stable": d.get("room_stable"),
+            "used_nodes": used_nodes,
+            "node_distances": node_distances,
+            "used_nodes_info": used_info
         }
 
     return jsonify({
@@ -239,7 +206,6 @@ def data_endpoint():
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
-
 def main(host: str = "0.0.0.0", port: int = 5000):
     th = threading.Thread(target=mqtt_thread, daemon=True)
     th.start()
@@ -249,7 +215,7 @@ def main(host: str = "0.0.0.0", port: int = 5000):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="ESPResense BLE visualisation Web server")
-    ap.add_argument("--host", default="0.0.0.0", help="HTTP bind address (default 0.0.0.0)")
-    ap.add_argument("--port", type=int, default=5000, help="HTTP port (default 5000)")
+    ap.add_argument("--host", default="0.0.0.0", help="HTTP bind address")
+    ap.add_argument("--port", type=int, default=5000, help="HTTP port")
     args = ap.parse_args()
     main(args.host, args.port)

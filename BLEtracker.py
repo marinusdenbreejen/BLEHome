@@ -12,6 +12,11 @@ import paho.mqtt.client as mqtt
 
 import numpy as np
 from scipy.optimize import minimize
+import logging
+
+# Set up a logger
+logger = logging.getLogger("BLEtracker")
+logging.basicConfig(level=logging.INFO)
 
 # Global configuration and runtime tracking variables
 config = None
@@ -53,47 +58,7 @@ def is_device_allowed(device_data):
             return True
     return False
 
-# Multilateration via weighted least squares
-# Given RSSI-derived distances to at least three fixed nodes, solve for the device position that best
-# fits the measured distances. Returns the estimated XYZ position, the list of nodes used, and a
-# residual-based accuracy metric (lower is better).
-def multilaterate(nodes, measurements):
-    # 1. Gather valid node positions and their corresponding measured distances
-    pts, dists, used, wts = [], [], [], []
-    for nm, node in nodes.items():
-        if nm in measurements:
-            p = np.array(node["point"], dtype=float)  # fixed node coordinates
-            dist = measurements[nm]  # measured distance to node
-            pts.append(p)
-            dists.append(dist)
-            # Weight inversely proportional to distance (avoid division by zero)
-            wts.append(1.0 / max(dist, 0.1))
-            used.append(nm)
-    # If no measurements are available, cannot multilaterate
-    if not pts:
-        raise ValueError("No measurements for multilateration.")
 
-    # Convert lists to numpy arrays for vectorized computation
-    pts = np.array(pts)
-    dists = np.array(dists)
-    wts = np.array(wts)
-
-    # 2. Initial guess: centroid of node positions
-    x0 = np.mean(pts, axis=0)
-
-    # 3. Define residuals function: difference between estimated and measured distances,
-    # scaled by weights
-    def residuals(X):
-        return wts * (np.linalg.norm(pts - X, axis=1) - dists)
-
-    # 4. Run least-squares optimization to minimize weighted residuals
-    result = least_squares(residuals, x0)
-
-    # 5. Compute accuracy as RMS of normalized residuals
-    acc = np.sqrt(np.mean((residuals(result.x) / wts)**2))
-
-    # Return estimated position, which nodes were used, and accuracy metric
-    return result.x, used, acc
 
 
 def multilaterate_nm(nodes, measurements,
@@ -168,8 +133,24 @@ def point_in_polygon(x, y, poly):
 # Determine which room a 3D point belongs to, or fallback to closest room
 def find_room_for_point(P):
     x, y, z = P
+    floors = config.get("floors", [])
+    if not floors:
+        return "Unknown", 0.0
+
+    # Find global zmin and zmax across all floors
+    zmins = [floor["bounds"][0][2] for floor in floors]
+    zmaxs = [floor["bounds"][1][2] for floor in floors]
+    global_zmin = min(zmins)
+    global_zmax = max(zmaxs)
+
+    # Clamp z to within building bounds
+    if z < global_zmin:
+        z = global_zmin
+    elif z > global_zmax:
+        z = global_zmax
+
     candidates = []
-    for floor in config.get("floors", []):
+    for floor in floors:
         zmin, zmax = floor["bounds"][0][2], floor["bounds"][1][2]
         if not (zmin <= z <= zmax):
             continue
@@ -180,10 +161,11 @@ def find_room_for_point(P):
         return candidates[0], 100.0
     # fallback to closest room centroid
     closest_room, min_dist = "Unknown", float('inf')
-    for floor in config.get("floors", []):
+    for floor in floors:
         for room in floor.get("rooms", []):
             pts = room.get("points", [])
-            if not pts: continue
+            if not pts:
+                continue
             centroid = np.mean(pts, axis=0)
             d = np.linalg.norm(np.array([x, y]) - centroid)
             if d < min_dist:
@@ -279,61 +261,126 @@ def process_tracking_cycle(client):
     now = time.time()
     for did, meas in node_measurements.items():
         # fresh measurements for multilateration
-        fresh = {n: m["distance"] for n, m in meas.items() if now - m["timestamp"] <= measurement_timeout}
-        # time since last seen
+        fresh = {
+            n: m["distance"]
+            for n, m in meas.items()
+            if now - m["timestamp"] <= measurement_timeout
+        }
         last_seen = max((m["timestamp"] for m in meas.values()), default=0)
         since = now - last_seen
         dname = next((m.get("name") for m in meas.values()), "unknown")
+
+        # will hold detailed per-node info
+        used_nodes_info = []
+
         if since > away_timeout:
             stable, fast = "away", "away"
-            acc, used, spos = None, [], [0,0,0]
+            acc, spos = None, [0, 0, 0]
         else:
             # attempt multilateration
-            est_pos, used, acc = None, [], None
+            est_pos, used_nodes, acc = None, [], None
             if len(fresh) >= 3:
                 try:
-                    est_pos, used, acc = multilaterate_nm(nodes_dict, fresh)
+                    est_pos, used_nodes, acc = multilaterate_nm(nodes_dict, fresh)
                 except Exception as e:
                     print(f"[BLEtracker] LS error for {did}:", e)
-            # fallback if no estimate
+
             if est_pos is None:
                 fb = nearest_node_locator(fresh)
                 if fb:
-                    est_pos, used, acc = fb
+                    est_pos, used_nodes, acc = fb
                 else:
                     stable, fast = "unknown", "unknown"
-                    spos = [0,0,0]
-                    accuracy = None
-                    used_nodes = []
-                    goto_publish = True
-            if est_pos is not None:
-                update_smoothed_position(did, est_pos)
-                spos = device_positions[did]
-                raw, conf = find_room_for_point(spos)
-                stable = get_stable_room(did, raw)
-                fast = raw
-        # publish if interval elapsed
-        if now - last_publish_time.get(did, 0) >= publish_interval:
-            ts = datetime.now().isoformat()
-            # Add distances from each used node
-            node_distances = {n: fresh[n] for n in used if n in fresh}
-            payload = {
-            "fast_room": fast,
-            "stable_room": stable,
-            "used_nodes": used,
-            "device_name": dname,
-            "device_id": did,
-            "timestamp": ts,
-            "accuracy": acc,
-            "position": list(map(float, spos)),
-            "node_distances": node_distances
-            }
-            topic = f"{MQTT_PUB_TOPIC_BASE}/{did}"
-            client.publish(topic, json.dumps(payload))
-            used_nodes_str = ", ".join(f"{n}:{fresh[n]:.2f}" for n in used if n in fresh)
-            print(f"[BLEtracker] {did} at {stable} ({acc if acc else 'N/A'}) | nodes: {used_nodes_str}")
-        
-            last_publish_time[did] = now
+                    spos = [0, 0, 0]
+                    acc = None
+                    # publish with empty node info
+                    publish_device_state(
+                        client, did, fast, stable, dname,
+                        acc, spos, fresh, now, used_nodes_info
+                    )
+                    continue
+
+            # got a position → update smoothing and room detection
+            update_smoothed_position(did, est_pos)
+            spos = device_positions[did]
+            raw, conf = find_room_for_point(spos)
+            stable = get_stable_room(did, raw)
+            fast = raw
+
+            # build detailed per-node info
+            for node in used_nodes:
+                m = meas.get(node, {})
+                used_nodes_info.append({
+                    "node": node,
+                    "distance": m.get("distance"),
+                    "last_seen": m.get("timestamp")
+                })
+
+        # publish only the detailed info list
+        publish_device_state(
+            client, did, fast, stable, dname,
+            acc, spos, fresh, now, used_nodes_info
+        )
+
+
+def publish_device_state(
+    client, did, fast, stable, dname,
+    acc, spos, fresh, now, used_nodes_info
+):
+    """
+    Publishes the device state to the MQTT broker.
+    """
+    payload = {
+        "id": did,
+        "name": dname,
+        "room_fast": fast,
+        "room_stable": stable,
+        "used_nodes_info": used_nodes_info,  # detailed per-node info only
+        "accuracy": acc,
+        "position": list(map(float, spos)),
+        "fresh": fresh,
+        "timestamp": now
+    }
+    topic = f"{MQTT_PUB_TOPIC_BASE}/detail/{did}"
+    try:
+        client.publish(topic, json.dumps(payload), qos=0, retain=True)
+    except Exception as e:
+        print(f"[BLEtracker] Failed to publish state for {did}: {e}")
+
+    # Only publish short message if room_stable has changed
+    prev_room = last_publish_time.get(did, {}).get("room_stable")
+    if prev_room != stable:
+        short_payload = {
+            "room_stable": stable,
+            "timestamp": now
+        }
+        short_topic = f"{MQTT_PUB_TOPIC_BASE}/{did}"
+        try:
+            client.publish(short_topic, json.dumps(short_payload), qos=0, retain=True)
+        except Exception as e:
+            print(f"[BLEtracker] Failed to publish short state for {did}: {e}")
+        # Track last published stable room
+        last_publish_time.setdefault(did, {})["room_stable"] = stable
+
+
+# get all devices from mqtt base topic and clear retained messages, even if they are not in the config file
+def clear_retained_messages(client):
+    """
+    Clears retained MQTT messages for each tracked device by publishing an empty payload 
+    with retain=True on its detail and short‐state topics.
+    """
+    # If we have a list of device IDs from last_publish_time:
+    for did in last_publish_time.keys():
+        for suffix in ("", "detail/"):
+            topic = f"{MQTT_PUB_TOPIC_BASE}/{suffix}{did}"
+            try:
+                client.publish(topic, payload="", qos=0, retain=True)
+                logger.debug("Cleared retained message on %s", topic)
+            except Exception:
+                logger.exception("Failed to clear retained message on %s", topic)
+
+
+
 
 # Initialization
 def initialize_tracker():
@@ -349,7 +396,12 @@ def initialize_tracker():
     publish_interval = 1
     last_publish_time = {}
     measurement_timeout = config.get("timeout", 30)
-    return setup_mqtt_client()
+
+    # Remove all devices from MQTT topics by publishing "away" state and clearing retained messages
+    client = setup_mqtt_client()
+    clear_retained_messages(client)
+    print("[BLEtracker] MQTT client setup complete.")
+    return client
 
 # Entry point
 if __name__ == "__main__":
@@ -358,7 +410,7 @@ if __name__ == "__main__":
     try:
         while True:
             process_tracking_cycle(client)
-            time.sleep(0.1)
+            time.sleep(1)
     except KeyboardInterrupt:
         print("[BLEtracker] Exiting...")
     finally:
